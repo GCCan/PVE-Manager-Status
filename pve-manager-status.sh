@@ -225,6 +225,8 @@ Defaults!PVE_MANAGER_STATUS !pam_session
 www-data ALL=(root) NOPASSWD: ${SENSORS_PATH}
 www-data ALL=(root) NOPASSWD: ${TURBOSTAT_PATH} -S -q -s PkgWatt -i 0.1 -n 1 -c package
 www-data ALL=(root) NOPASSWD: ${SMARTCTL_PATH} -a /dev/*
+www-data ALL=(root) NOPASSWD: ${SMARTCTL_PATH} --scan-open -j
+www-data ALL=(root) NOPASSWD: ${SMARTCTL_PATH} -a -j -d * /dev/*
 www-data ALL=(root) NOPASSWD: ${IOSTAT_PATH} -d -x -k 1 1
 
 EOM
@@ -293,7 +295,49 @@ done
 
 cat >> "$tmpf1" << 'EOF'
 
-        $res->{sata_status} = `sudo smartctl -a /dev/sd? | grep -E "Device Model|Capacity|Power_On_Hours|Temperature"`;
+        # Keep SATA reporting as a JSON string; each entry is one device.
+        require JSON::PP;
+        my $sata_read_json = sub {
+            my (@args) = @_;
+            # List-form open avoids shell expansion; sudo must never prompt.
+            open(my $fh, '-|', '/usr/bin/timeout', '5s',
+                'sudo', '-n', 'smartctl', @args) or return;
+            my $raw = do { local $/; <$fh> };
+            close($fh);
+            # SMART health warnings are nonzero exit bitmasks, not invalid JSON.
+            my $json = eval { JSON::PP::decode_json($raw // '') };
+            return ref($json) eq 'HASH' ? $json : undef;
+        };
+        my $scan = $sata_read_json->('--scan-open', '-j');
+        my (@devices, %seen, %scanned_paths);
+        for my $dev (@{($scan && ref($scan->{devices}) eq 'ARRAY') ? $scan->{devices} : []}) {
+            next unless ref($dev) eq 'HASH';
+            my ($name, $type) = @{$dev}{qw(name type)};
+            next unless defined($name) && $name =~ m{\A/dev/[A-Za-z0-9_./-]+\z};
+            next unless defined($type) && $type =~ m{\A[A-Za-z0-9_,/+.-]+\z};
+            # NVMe has its own existing widgets, including USB NVMe bridges.
+            next if lc($dev->{protocol} // '') eq 'nvme' || $type =~ /nvme/i;
+            next if $seen{"$name|$type"}++;
+            push @devices, { name => $name, type => $type };
+            $scanned_paths{$name} = 1;
+        }
+        # sysfs lists whole disks only and also covers sdaa, sdab, ... .
+        # Fall back for disks the scan could not open or did not discover.
+        for my $path (sort glob('/sys/block/sd*')) {
+            next unless $path =~ m{/([s]d[a-z]+)\z};
+            my $name = "/dev/$1";
+            next if $scanned_paths{$name};
+            push @devices, { name => $name, type => 'auto' };
+        }
+        my @sata_status;
+        for my $dev (@devices) {
+            my $info = $sata_read_json->('-a', '-j', '-d', $dev->{type}, $dev->{name});
+            $info //= { error => 'SMART unavailable (permission, timeout or invalid JSON)' };
+            next if lc($info->{device}->{protocol} // '') eq 'nvme';
+            $info->{device} = { %{$info->{device} // {}}, %$dev };
+            push @sata_status, $info;
+        }
+        $res->{sata_status} = JSON::PP::encode_json(\@sata_status);
 EOF
 
 # 在实际修改前检查锚点文本是否存在, 若不存在则报错退出停止修改
@@ -925,28 +969,35 @@ cat >> "$tmpf2" << 'EOF'
                 if (value.length > 0) {
                 try {
                 const jsonData = JSON.parse(value);
-                if (jsonData.standy === true) {
-                return '休眠中';
-                }
-                let output = '';
-                if (jsonData.model_name) {
-                output = `<strong>${jsonData.model_name}</strong><br>`;
-                        if (jsonData.temperature?.current !== undefined) {
-                        output += `温度: <strong>${colorizeHddTemp(jsonData.temperature.current)}</strong>`;
-                        }
-                        if (jsonData.power_on_time?.hours !== undefined) {
-                        if (output.length > 0) output += ' | ';
-                        output += `通电: ${jsonData.power_on_time.hours}小时`;
-                        if (jsonData.power_cycle_count) {
-                        output += `, 次数: ${jsonData.power_cycle_count}`;
-                        }
-                        }
-                        if (jsonData.smart_status?.passed !== undefined) {
-                        if (output.length > 0) output += ' | ';
-                        output += 'SMART: ' + (jsonData.smart_status.passed ? '正常' : '警告!');
-                        }
-                        return output;
-                        }
+                const disks = Array.isArray(jsonData) ? jsonData : [jsonData];
+                const escape = text => Ext.String.htmlEncode(String(text));
+                const outputs = disks.map(disk => {
+                    const name = disk.model_name || [disk.vendor, disk.product].filter(Boolean).join(' ') || disk.device?.name || '未知硬盘';
+                    const label = [disk.device?.name, disk.device?.type].filter(Boolean).join(' / ');
+                    const fields = [];
+                    if (disk.user_capacity?.bytes !== undefined) {
+                        fields.push(`容量: ${(disk.user_capacity.bytes / 1e9).toFixed(1)} GB`);
+                    }
+                    if (disk.temperature?.current !== undefined) {
+                        fields.push(`温度: <strong>${colorizeHddTemp(Number(disk.temperature.current))}</strong>`);
+                    } else {
+                        fields.push('温度: 未报告');
+                    }
+                    if (disk.power_on_time?.hours !== undefined) {
+                        fields.push(`通电: ${escape(disk.power_on_time.hours)}小时`);
+                    }
+                    if (disk.power_cycle_count !== undefined) {
+                        fields.push(`次数: ${escape(disk.power_cycle_count)}`);
+                    }
+                    if (disk.smart_status?.passed !== undefined) {
+                        fields.push('SMART: ' + (disk.smart_status.passed ? '正常' : '警告!'));
+                    }
+                    if (disk.error) fields.push(escape(disk.error));
+                    const messages = (disk.smartctl?.messages || []).filter(message => message.severity === 'error');
+                    for (const message of messages) fields.push(escape(message.string));
+                    return `<strong>${escape(name)}</strong>${label ? ' (' + escape(label) + ')' : ''}<br>${fields.join(' | ')}`;
+                });
+                return outputs.length ? outputs.join('<br><br>') : '提示: 未发现可扫描的 SATA/SAS 硬盘';
                         } catch (e) {
                         }
                         let outputs = [];
